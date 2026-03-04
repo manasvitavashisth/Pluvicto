@@ -1,0 +1,335 @@
+# =============================================================================
+# Pluvicto SV Signature Analysis
+# Analyzes structural variant (SV) signatures, indel ratios, and clonal
+# diversity in Pluvicto-treated vs. control prostate cancer samples.
+# =============================================================================
+
+# ── Libraries ─────────────────────────────────────────────────────────────────
+library(lmerTest)    # Mixed-effects models with p-values
+library(hrbrthemes)  # ggplot2 themes
+library(ggplot2)
+library(viridis)     # Color scales
+library(data.table)  # Fast file I/O
+library(stringr)     # String manipulation
+library(readxl)      # Excel file reading
+library(tidyr)       # pivot_longer
+library(umap)        # UMAP dimensionality reduction
+
+# ── Sample Definitions ────────────────────────────────────────────────────────
+
+# Pluvicto-treated tumor samples (WGS + flow-cytometry pairs)
+pluvicto <- c(
+  '18-078_LIVR_L_WGS', '18-078_LUNG_I_WGS',
+  '22-049_LIVR_H_WGS', '22-049_LUNG_M_WGS', '22-049_SOFT_O_WGS',
+  '22-051_LUNG_E_WGS',
+  '23-008_LN_H_WGS',   '23-008_LN_K_WGS',
+  '23-009_LN_Q_WGS',   '23-009_LUNG_M_WGS',
+  'FH0847_E_C1', 'FH0822_E_C1',
+  'FH0847_E_C2', 'FH0822_E_C2'
+)
+
+# Patients to exclude due to microsatellite instability (MSI-High)
+msi_patient    <- c('19-074', '00-010', '17-081', '19-029', '18-059')
+
+# Pluvicto patient IDs (prefix only)
+pluvicto_patient <- c('18-078', '22-049', '22-051', '23-008', '23-009')
+
+# ── File Paths ────────────────────────────────────────────────────────────────
+
+BASE_SV       <- '/fh/fast/ha_g/projects/ProstateTAN/analysis_CN-SV/SV'
+BASE_SIG      <- '/fh/fast/ha_g/projects/ProstateTAN/analysis_mutational'
+ANNOTATION_XL <- '/fh/fast/ha_g/projects/ProstateTAN/analysis_CN-SV/SV_Signatures/Annotation.xlsx'
+CLINICAL_XL   <- paste0(BASE_SIG, '/Prostate_TAN_clinical_data.xlsx')
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+#' Extract patient ID (everything before the first underscore)
+get_patient_id <- function(sample_names) str_extract(sample_names, "[^_]+")
+
+#' Load and normalise a SigProfiler Activities file.
+#' Returns a data.frame with proportions (rows sum to 1) and a `Samples` column.
+load_sig_activities <- function(path) {
+  df  <- as.data.frame(fread(path, header = TRUE, sep = "\t",
+                              stringsAsFactors = FALSE, na.strings = c(".", "NA")))
+  mat <- df[, 2:ncol(df)]
+  mat <- mat[, colSums(mat) != 0, drop = FALSE]   # drop all-zero signatures
+  mat <- mat / rowSums(mat)                         # normalise to proportions
+  mat$Samples <- df$Samples
+  mat
+}
+
+#' Load per-sample SV counts for a vector of sample names.
+#' Returns a data.frame with columns: sample, Trans_Bal, Trans_Unbal,
+#' TandemDup, Inversion_Bal, Inversion_Unbal, Deletion, InterChr.
+load_sv_counts <- function(samples, sv_base_path) {
+  sv_types <- c('Trans-Bal', 'Trans-Unbal', 'TandemDup',
+                'Inversion-Bal', 'Inversion-Unbal', 'Deletion')
+
+  results <- lapply(samples, function(s) {
+    path <- file.path(sv_base_path, 'output', 'TwoOverlap', s,
+                      paste0(s, '.mergedTitan.sv.txt'))
+    sv   <- as.data.frame(fread(path, header = TRUE, sep = "\t",
+                                 stringsAsFactors = FALSE, na.strings = c(".", "NA")))
+    counts <- sapply(sv_types, function(t) sum(sv$CN_overlap_type == t, na.rm = TRUE))
+    inter  <- sum(sv$type == 'InterChr', na.rm = TRUE)
+    c(list(sample = s), as.list(counts), list(InterChr = inter))
+  })
+
+  out <- as.data.frame(rbindlist(lapply(results, as.data.table)))
+  # Clean up column names (replace hyphens from SV type labels)
+  colnames(out) <- c('sample', 'Trans_Bal', 'Trans_Unbal', 'TandemDup',
+                     'Inversion_Bal', 'Inversion_Unbal', 'Deletion', 'InterChr')
+  out
+}
+
+#' Load per-sample indel counts for a vector of sample names.
+#' Returns a data.frame with columns: sample, Deletion, Insertion, ratio.
+load_indel_counts <- function(samples, indel_base_path) {
+  results <- lapply(samples, function(s) {
+    path <- file.path(indel_base_path, 'Indels', 'CombinedIndels',
+                      paste0(s, '_CombinedIndels.txt'))
+    sv   <- as.data.frame(fread(path, header = TRUE, sep = "\t",
+                                 stringsAsFactors = FALSE, na.strings = c(".", "NA")))
+    tbl  <- table(sv$type)
+    del  <- as.numeric(tbl['Deletion'])
+    ins  <- as.numeric(tbl['Insertion'])
+    list(sample = s, Deletion = del, Insertion = ins, ratio = del / ins)
+  })
+  as.data.frame(rbindlist(lapply(results, as.data.table)))
+}
+
+#' Generic boxplot with jitter using viridis fill.
+plot_boxplot <- function(data, x_var, y_var, title, y_label) {
+  ggplot(data, aes_string(x = x_var, y = y_var, fill = x_var)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
+    geom_jitter(color = "black", size = 0.4, alpha = 0.9) +
+    theme_ipsum() +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 11)) +
+    ggtitle(title) +
+    xlab(x_var) +
+    ylab(y_label)
+}
+
+#' Fit a mixed-effects model and return the fixed-effect p-value for predictor[2].
+lmer_pvalue <- function(formula, data) {
+  model <- lmer(formula, data = data)
+  coef(summary(model))[, "Pr(>|t|)"][2]
+}
+
+# ── 1. Derive Control Samples ─────────────────────────────────────────────────
+
+# Annotation for MSI / HRD / TDP status
+annotation <- read_excel(ANNOTATION_XL)
+msi <- annotation$Sample[annotation$MSI_High == 'Y']
+
+# Clinical data: patients without prior radiation & not Pluvicto / MSI-High
+clinical      <- read_excel(CLINICAL_XL)
+no_rad_pts    <- clinical$`Tissue #`[clinical$XRT == 'N']
+control_pts   <- no_rad_pts[
+  !no_rad_pts %in% pluvicto_patient &
+  !no_rad_pts %in% msi_patient
+]
+
+# All tumor samples (assumed available from upstream object `tumor`)
+# tumor must have columns: sample_name, patient
+all_samples    <- sort(unique(tumor$sample_name))
+sample_patient <- get_patient_id(all_samples)
+
+control_sample <- all_samples[sample_patient %in% control_pts]
+
+# Remaining non-MSI, non-Pluvicto, non-control samples ("radiation" group)
+other <- all_samples[
+  !all_samples %in% msi &
+  !all_samples %in% control_sample &
+  !all_samples %in% pluvicto
+]
+
+# ── 2. SV Count Analysis ──────────────────────────────────────────────────────
+
+sv_pluvicto <- load_sv_counts(pluvicto,       BASE_SV)
+sv_control  <- load_sv_counts(control_sample, BASE_SV)
+sv_other    <- load_sv_counts(other,          BASE_SV)
+
+# Combine and label groups
+sv_all <- rbind(
+  cbind(sv_pluvicto, bal = 'pluvicto'),
+  cbind(sv_control,  bal = 'no_radiation'),
+  cbind(sv_other,    bal = 'radiation')
+)
+sv_all$patient <- get_patient_id(sv_all$sample)
+
+# ── 2a. Statistical tests (mixed model, patient as random effect) ─────────────
+
+sv_metrics <- c('Trans_Bal', 'Trans_Unbal', 'TandemDup',
+                 'Inversion_Bal', 'Inversion_Unbal', 'Deletion', 'InterChr')
+
+# p-values across all three groups
+sv_pvals_all <- sapply(sv_metrics, function(m) {
+  lmer_pvalue(as.formula(paste(m, '~ bal + (1|patient)')), data = sv_all)
+})
+print(sv_pvals_all)
+
+# p-values for Pluvicto vs. radiation only
+sv_pluvicto_vs_rad <- sv_all[sv_all$bal %in% c('pluvicto', 'radiation'), ]
+sv_pvals_pvr <- sapply(sv_metrics, function(m) {
+  lmer_pvalue(as.formula(paste(m, '~ bal + (1|patient)')), data = sv_pluvicto_vs_rad)
+})
+print(sv_pvals_pvr)
+
+# ── 2b. SV Boxplots ───────────────────────────────────────────────────────────
+
+sv_plot_labels <- list(
+  Trans_Unbal   = 'Average Unbalanced Translocation',
+  Trans_Bal     = 'Average Balanced Translocation',
+  Inversion_Bal = 'Average Balanced Inversions',
+  InterChr      = 'Average InterChromosomal Events',
+  Deletion      = 'Average Deletion Events'
+)
+
+for (metric in names(sv_plot_labels)) {
+  print(plot_boxplot(sv_all, 'bal', metric, 'Pluvicto SVs', sv_plot_labels[[metric]]))
+}
+
+# ── 3. SV Signature Analysis ──────────────────────────────────────────────────
+
+# Load and filter RS (rearrangement signature) activities
+sv_sig <- as.data.frame(fread(
+  file.path(BASE_SV, 'SV_Signatures/Assignment_RS_blacklist_removed/Assignment_Solution/Activities/Assignment_Solution_Activities.txt'),
+  header = TRUE, sep = "\t", stringsAsFactors = FALSE, na.strings = c(".", "NA")
+))
+sv_sig$Samples <- sub("_TwoOverlap_chr\\.txt$", "", sv_sig$Samples)
+sv_sig <- sv_sig[sv_sig$Samples %in% c(pluvicto, other), ]
+
+sig_mat           <- sv_sig[, 2:ncol(sv_sig)]
+sig_mat           <- sig_mat[, colSums(sig_mat) != 0, drop = FALSE]
+sig_mat           <- sig_mat / rowSums(sig_mat)
+rownames(sig_mat) <- sv_sig$Samples
+sig_mat$pluvicto  <- rownames(sig_mat) %in% pluvicto
+
+# t-test for each RS signature between groups
+rs_sigs   <- setdiff(colnames(sig_mat), 'pluvicto')
+rs_pvals  <- sapply(rs_sigs, function(s) {
+  t.test(sig_mat[[s]] ~ sig_mat$pluvicto)$p.value
+})
+print(sort(rs_pvals))
+
+# Example plot: Reference Signature R2
+print(plot_boxplot(sig_mat, 'pluvicto', 'Ref.Sig.R2',
+                   'Pluvicto SV Signature Analysis', 'Reference Signature 2'))
+
+# ── 4. Mutational Signature UMAP ─────────────────────────────────────────────
+
+mut_sig <- load_sig_activities(
+  paste0(BASE_SIG, '/Sigprofiler_new/Input/output/Assignment_Solution/Activities/Assignment_Solution_Activities.txt')
+)
+mut_mat <- mut_sig[, !colnames(mut_sig) %in% 'Samples']
+
+set.seed(777)
+umap_res <- umap(mut_mat)
+umap_df  <- data.frame(
+  UMAP1    = umap_res$layout[, 1],
+  UMAP2    = umap_res$layout[, 2],
+  pluvicto = ifelse(get_patient_id(mut_sig$Samples) %in% pluvicto_patient,
+                    'Pluvicto', 'Non-Pluvicto')
+)
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = pluvicto)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "UMAP Visualization Colored by Pluvicto Status",
+       x = "UMAP1", y = "UMAP2") +
+  scale_color_discrete(name = "Pluvicto")
+
+# ── 5. Per-Patient SV Signature Stacked Barplots ──────────────────────────────
+
+# Load clonality-aware cosmic SV activities
+sv_clonal <- as.data.frame(fread(
+  file.path(BASE_SV, 'SV_Signatures/Clonality_Assignment_cosmic/Assignment_Solution/Activities/Assignment_Solution_Activities.txt'),
+  header = TRUE, sep = "\t", stringsAsFactors = FALSE, na.strings = c(".", "NA")
+))
+sv_clonal$patient <- get_patient_id(sv_clonal$Samples)
+sv_clonal <- sv_clonal[sv_clonal$patient %in% pluvicto_patient, ]
+
+sig_clonal_mat           <- sv_clonal[, 2:11]
+sig_clonal_mat           <- sig_clonal_mat / rowSums(sig_clonal_mat)
+sig_clonal_mat$sample    <- sv_clonal$Samples
+sig_clonal_mat$patient   <- sv_clonal$patient
+
+#' Plot stacked barplot of SV signature proportions for one patient.
+plot_patient_sig_bars <- function(data, pt_id, sig_cols) {
+  pt      <- data[data$patient == pt_id, c(sig_cols, 'sample')]
+  pt_long <- pivot_longer(pt, -sample, names_to = "variable", values_to = "value")
+  pt_long <- pt_long[pt_long$value != 0, ]
+
+  ggplot(pt_long, aes(x = sample, y = value, fill = variable)) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    labs(x = "Sample", y = "Proportion",
+         title = paste("SV Signatures –", pt_id)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+          legend.text = element_text(size = 14))
+}
+
+sig_cols <- setdiff(colnames(sig_clonal_mat), c('sample', 'patient'))
+
+for (pt in pluvicto_patient) {
+  print(plot_patient_sig_bars(sig_clonal_mat, pt, sig_cols))
+}
+
+# ── 6. Indel Analysis ────────────────────────────────────────────────────────
+
+indel_pluvicto <- load_indel_counts(pluvicto,       BASE_SIG)
+indel_control  <- load_indel_counts(control_sample, BASE_SIG)
+indel_other    <- load_indel_counts(other,          BASE_SIG)
+
+indel_all <- rbind(
+  cbind(indel_pluvicto, bal = 'pluvicto'),
+  cbind(indel_control,  bal = 'no_radiation'),
+  cbind(indel_other,    bal = 'radiation')
+)
+indel_all$patient <- get_patient_id(indel_all$sample)
+
+# Mixed-model p-values for indel metrics
+indel_metrics <- c('Deletion', 'Insertion', 'ratio')
+indel_pvals   <- sapply(indel_metrics, function(m) {
+  lmer_pvalue(as.formula(paste(m, '~ bal + (1|patient)')), data = indel_all)
+})
+print(indel_pvals)
+
+# Pluvicto vs. radiation only
+indel_pvr       <- indel_all[indel_all$bal %in% c('pluvicto', 'radiation'), ]
+indel_pvals_pvr <- sapply(indel_metrics, function(m) {
+  lmer_pvalue(as.formula(paste(m, '~ bal + (1|patient)')), data = indel_pvr)
+})
+print(indel_pvals_pvr)
+
+# Indel boxplots
+print(plot_boxplot(indel_all, 'bal', 'ratio',    'Pluvicto Indels', 'Ratio of Deletions to Insertions'))
+print(plot_boxplot(indel_all, 'bal', 'Deletion', 'Pluvicto Indels', 'Deletions'))
+
+# ── 7. Clonal Diversity Analysis ─────────────────────────────────────────────
+
+# `track` is assumed to be pre-loaded with columns:
+# Sample, Shannon, Shannon_Mutational, Simpson, Simpson_Mutational,
+# Number_of_Clones, organ, patient, number_of_samples
+
+colnames(track) <- c('Sample', 'Shannon', 'Shannon_Mutational',
+                     'Simpson', 'Simpson_Mutational', 'Number_of_Clones', 'organ')
+
+# Filter: only patients with exactly 2 samples, exclude MSI-High
+track_sub          <- track[track$number_of_samples == 2 & !is.na(track$Sample), ]
+track_sub$pluvicto <- track_sub$Sample %in% pluvicto
+track_sub          <- track_sub[!track_sub$patient %in% msi_patient, ]
+
+# Mixed-model p-values for diversity metrics
+diversity_metrics <- c('Number_of_Clones', 'Simpson_Mutational')
+div_pvals <- sapply(diversity_metrics, function(m) {
+  lmer_pvalue(as.formula(paste(m, '~ pluvicto + (1|patient)')), data = track_sub)
+})
+print(div_pvals)
+
+# Diversity boxplot
+print(plot_boxplot(track_sub, 'pluvicto', 'Simpson_Mutational',
+                   'Clonal Diversity', 'Simpson Mutational Index'))
