@@ -1,0 +1,490 @@
+# =============================================================================
+# Pluvicto SNV / TMB / Clonal Architecture / CNV / Mutational Signature Analysis
+#
+# This script covers:
+#   1. Sample definitions & clinical metadata
+#   2. Tumour mutational burden (TMB)
+#   3. PyClone clonal architecture (founder / shared / private proportions)
+#   4. Mitochondrial mutation counts
+#   5. CNV annotation per gene
+#   6. MAF / oncoplot generation (maftools)
+#   7. Mutational signature (SBS) comparison
+#   8. File export & TITAN result staging utilities
+# =============================================================================
+
+# ── Libraries ─────────────────────────────────────────────────────────────────
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(viridis)
+library(hrbrthemes)
+library(readxl)
+library(lmerTest)
+library(maftools)
+library(stringr)
+
+# ── File Path Constants ───────────────────────────────────────────────────────
+BASE_PROJ      <- '/fh/fast/ha_g/projects/ProstateTAN'
+BASE_PLUVICTO  <- file.path(BASE_PROJ, 'Pluvicto')
+BASE_MUT       <- file.path(BASE_PROJ, 'analysis_mutational')
+BASE_CN        <- file.path(BASE_PROJ, 'analysis_CN-SV')
+BASE_CTDNA     <- file.path(BASE_PROJ, 'analysis_ctDNA')
+BASE_COLLAB    <- '/fh/fast/ha_g/projects/Collaborations/Haffner/Pluvicto'
+
+PYCLONE_DIR    <- file.path(BASE_MUT, 'Pyclone')
+OPTIMAL_TITAN  <- file.path(BASE_CN, 'optimalTITAN')
+SIG_ACTIVITIES <- file.path(BASE_MUT, 'sigProfiler/input/output/Assignment_Solution/Activities/Assignment_Solution_Activities.txt')
+GENE_LIST_PATH <- file.path(BASE_CN, 'JASMINE/Plots/data/20230823_Composite_PC_GeneList.txt')
+CURATED_SOL_XL <- file.path(OPTIMAL_TITAN, 'Curated_Solution.xlsx')
+CYCLES_XL      <- file.path(BASE_PLUVICTO, 'Pluvicto cycles.xlsx')
+NUM_SAMPLES_TXT<- file.path(BASE_MUT, 'Number_of_samples.txt')
+
+# ── Sample Definitions ────────────────────────────────────────────────────────
+
+# Core Pluvicto-treated WGS samples used in most analyses
+pluvicto <- c(
+  '18-078_LIVR_L_WGS', '18-078_LUNG_I_WGS',
+  '22-049_LIVR_H_WGS', '22-049_LUNG_M_WGS', '22-049_SOFT_O_WGS',
+  '22-051_LUNG_E_WGS',
+  '23-008_LN_H_WGS',   '23-008_LN_K_WGS',
+  '23-009_LN_Q_WGS',   '23-009_LUNG_M_WGS'
+)
+
+# Pluvicto patient IDs (prefix only, includes 23-015 for cycle data)
+pluvicto_patient <- c('18-078', '22-049', '22-051', '23-008', '23-009', '23-015')
+
+# 18-078 samples processed through the NT (normal-tumour) TitanCNA pipeline
+sample_nt <- c('18-078_LIVR_L_WGS', '18-078_LUNG_I_WGS')
+
+# Non-Pluvicto comparison samples (MSI-High cases already excluded)
+other_wo_msi <- c(
+  '00-140_LIVR_G_WGS', '00-140_LN_J_WGS',
+  '05-148_LIVR_E_WGS',
+  '05-217_LN_I_WGS',   '05-217_LN_N_WGS', '05-217_LN_F_WGS', '05-217_LUNG_L_WGS',
+  '05-187_LN_J_WGS',
+  '06-081_LN_H_WGS',   '06-131_BONE_TT_WGS',
+  '07-062_LUNG_F_WGS',
+  '12-021_LIVR_H_WGS', '12-021_LUNG_I_WGS', '12-021_PLEUR_J_WGS',
+  '13-084_LIVR_H_WGS',
+  '13-099_LIVR_H_WGS', '13-099_LN_K_WGS', '13-099_LUNG_J_WGS',
+  '13-117_LIVR_H_WGS',
+  '15-003_LIVR_H_WGS',
+  '15-010_LIVR_H_WGS', '15-010_LN_K_WGS',
+  '15-069_LIVR_K_WGS', '15-069_LN_P_WGS',
+  '15-096_BONE_FF_WGS', '15-096_DIAP_M_WGS', '15-096_PERIA_L_WGS',
+  '17-033_PANC_H_WGS',  '17-033_PANC_J_WGS',
+  '17-043_LN_I_WGS',    '17-043_PERIRO_J_WGS',
+  '18-082_LIVR_M_WGS',  '18-082_LN_J_WGS',
+  '18-112_LIVR_H_WGS',
+  '18-115_LN_H_WGS',
+  '18-123_ADRL_G_WGS',  '18-123_LIVR_I_WGS', '18-123_LIVR_K_WGS',
+  '19-026_ADRL_M_WGS',  '19-026_LIVR_H_WGS',
+  '19-028_LIVR_H_WGS',  '19-028_LIVR_I_WGS',
+  '19-045_LIVR_H_WGS',  '19-045_LIVR_J_WGS', '19-045_LN_M_WGS',
+  '19-048_LIVR_H_WGS',  '19-048_LN_I_WGS',
+  '20-008_LN_J_WGS',    '20-008_LN_L_WGS',
+  '20-013_SKIN_MET2_WGS','20-013_SKIN_MET3_WGS',
+  '20-014_LIVR_H_WGS',
+  '00-147_BONE_HH_WGS',  '00-147_BONE_NN_WGS'
+)
+
+# Combined sample vector used in CNV / MAF analyses
+all_samples <- c(pluvicto, other_wo_msi)
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+#' Extract patient ID from sample name (everything before the first underscore).
+get_patient_id <- function(x) str_extract(x, "[^_]+")
+
+#' Read a tab-separated flat file into a data.frame.
+read_tsv_df <- function(path, ...) {
+  as.data.frame(fread(path, header = TRUE, sep = "\t",
+                      stringsAsFactors = FALSE, na.strings = c(".", "NA"), ...))
+}
+
+#' Generic boxplot with viridis fill and jitter.
+plot_boxplot <- function(data, x_var, y_var, title, y_label) {
+  ggplot(data, aes_string(x = x_var, y = y_var, fill = x_var)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
+    geom_jitter(color = "black", size = 0.4, alpha = 0.9) +
+    theme_ipsum() +
+    theme(legend.position = "none", plot.title = element_text(size = 11)) +
+    ggtitle(title) + xlab(x_var) + ylab(y_label)
+}
+
+#' Count mitochondrial SNVs (Chr == 'chrM') from a per-sample SNV file.
+count_mito_snvs <- function(sample_name, snv_dir) {
+  path <- file.path(snv_dir, paste0(sample_name, '_Combined_TumorMutationCalls.txt'))
+  snv  <- read_tsv_df(path)
+  sum(snv$Chr == 'chrM', na.rm = TRUE)
+}
+
+# ── 1. Load Core Data ─────────────────────────────────────────────────────────
+
+# All somatic SNVs for Pluvicto + comparison samples (pre-filtered, no per-sample
+# power analysis applied)
+tumor <- read_tsv_df(file.path(BASE_CTDNA, 'SNVs/MasterSNVFile_tumor_wo_perSample_PowerAnalysis.txt'))
+
+# Sample-count metadata (used to filter patients with exactly N tumour samples)
+number <- read_tsv_df(NUM_SAMPLES_TXT)
+
+# Pluvicto treatment cycle information
+cycles         <- read_excel(CYCLES_XL)
+cycles         <- cycles[cycles$`Tissue #` %in% pluvicto_patient, ]
+cycles$patient <- cycles$`Tissue #`
+
+# ── 2. Tumour Mutational Burden (TMB) ─────────────────────────────────────────
+
+# Count SNVs per sample and flag Pluvicto samples
+tmb          <- as.data.frame(table(tumor$sample_name))
+tmb$pluvicto <- tmb$Var1 %in% pluvicto
+tmb$patient  <- get_patient_id(as.character(tmb$Var1))
+
+# Exclude extreme outliers (likely hypermutators / MSI-High)
+tmb_filtered <- tmb[tmb$Freq < 45000, ]
+
+# Mixed-effects model: TMB ~ Pluvicto status, patient as random effect
+model_tmb <- lmer(Freq ~ pluvicto + (1 | patient), data = tmb_filtered)
+summary(model_tmb)
+
+# Per-patient average TMB correlated with treatment duration
+tmb_pluvicto <- tmb[tmb$Var1 %in% pluvicto, ]
+tmb_avg      <- aggregate(Freq ~ patient, data = tmb_pluvicto, FUN = mean)
+tmb_avg      <- left_join(tmb_avg, cycles, by = 'patient')
+
+# Scatter: average TMB vs. number of Pluvicto cycles
+ggplot(tmb_avg, aes(x = Freq, y = `# cycles`)) +
+  geom_point() +
+  geom_text(aes(label = patient), nudge_x = 0.25, nudge_y = 0.25,
+            check_overlap = TRUE) +
+  theme_ipsum() +
+  labs(x = "Mean SNVs", y = "# Pluvicto Cycles")
+
+# TMB boxplot: Pluvicto vs. other
+print(plot_boxplot(tmb_filtered, 'pluvicto', 'Freq',
+                   'Tumour Mutational Burden', 'SNV Count'))
+
+# ── 3. PyClone Clonal Architecture ───────────────────────────────────────────
+
+#' Compute per-patient proportions of founder / shared / private mutations
+#' from a clusters data.frame that contains a status column (pyclone_status or
+#' lichee_status) and number_of_mutations.
+#'
+#' @param clusters   data.frame: patient, number_of_mutations, <status_col>
+#' @param status_col column name for clone classification (string)
+#' @return data.frame: patient, founder, shared, private
+compute_clone_proportions <- function(clusters, status_col) {
+  patients <- unique(clusters$patient)
+
+  results <- lapply(patients, function(pt) {
+    pt_data <- clusters[clusters$patient == pt, ]
+    pt_data <- pt_data[!duplicated(pt_data$number_of_mutations), ]
+    pt_data <- pt_data[!is.na(pt_data[[status_col]]), ]
+    if (nrow(pt_data) == 0) return(NULL)
+
+    pt_data$prop <- pt_data$number_of_mutations / sum(pt_data$number_of_mutations)
+
+    mean_prop <- function(status) {
+      mean(pt_data$prop[pt_data[[status_col]] == status], na.rm = TRUE)
+    }
+
+    data.frame(patient = pt,
+               founder = mean_prop('Founder'),
+               shared  = mean_prop('Shared'),
+               private = mean_prop('Private'))
+  })
+
+  do.call(rbind, Filter(Negate(is.null), results))
+}
+
+# Load PyClone cluster assignments
+clusters_raw <- read_tsv_df(file.path(PYCLONE_DIR, 'Clusters.txt'))
+clusters     <- clusters_raw[clusters_raw$cellular_prevalence > 0.05 &
+                               clusters_raw$number_of_mutations  > 10, ]
+clusters     <- left_join(clusters, number, by = 'patient')
+
+#' Annotate a clone-proportion table with Pluvicto status and restrict to
+#' patients present in the multi-sample number table.
+annotate_pluvicto <- function(df, num_samples_df, pt_ids) {
+  df_sub          <- df[df$patient %in% num_samples_df$patient, ]
+  df_sub$pluvicto <- df_sub$patient %in% pt_ids
+  df_sub
+}
+
+# Compute proportions under both tree-building methods and annotate
+track_pyclone_sub <- annotate_pluvicto(
+  compute_clone_proportions(clusters, 'pyclone_status'), number, pluvicto_patient)
+
+track_lichee_sub  <- annotate_pluvicto(
+  compute_clone_proportions(clusters, 'lichee_status'),  number, pluvicto_patient)
+
+# Plots and tests for both methods
+for (df_sub in list(track_pyclone_sub, track_lichee_sub)) {
+  print(plot_boxplot(df_sub, 'pluvicto', 'founder',
+                     'Proportion of Founder Mutations', 'Proportion'))
+  print(plot_boxplot(df_sub, 'pluvicto', 'private',
+                     'Proportion of Private Mutations', 'Proportion'))
+  print(wilcox.test(founder ~ pluvicto, data = df_sub))
+  print(wilcox.test(private ~ pluvicto, data = df_sub))
+}
+
+# ── 4. Mitochondrial Mutation Counts ─────────────────────────────────────────
+
+snv_dir  <- file.path(BASE_CTDNA, 'SNVs')
+mt_counts <- data.frame(
+  sample   = c(pluvicto, other_wo_msi),
+  mito_snv = sapply(c(pluvicto, other_wo_msi), count_mito_snvs, snv_dir = snv_dir),
+  group    = rep(c('pluvicto', 'other'), c(length(pluvicto), length(other_wo_msi)))
+)
+
+# Chi-squared test: chrM mutation enrichment in Pluvicto samples
+tumor$pluvicto     <- tumor$sample_name %in% pluvicto
+tumor$mitochondria <- tumor$Chr == 'chrM'
+contingency        <- table(tumor$pluvicto, tumor$mitochondria)
+print(chisq.test(contingency))
+print(prop.table(contingency, margin = 1))
+mosaicplot(contingency, main = "Pluvicto vs. Mitochondrial SNVs", color = TRUE)
+
+# ── 5. CNV Annotation per Gene ────────────────────────────────────────────────
+
+# Gene coordinates (prostate cancer gene panel)
+genes <- read_tsv_df(GENE_LIST_PATH, header = FALSE)
+colnames(genes) <- c('gene_name', 'seqid', 'start', 'end')
+
+# TITAN optimal solution (cluster & ploidy per sample)
+optimal_solution <- read_excel(CURATED_SOL_XL)
+optimal_solution <- optimal_solution[optimal_solution$Sample %in% all_samples, ]
+
+#' Annotate CNV calls for one sample against the gene panel using TITAN segments.
+#' Returns a data.frame with one row per gene.
+annotate_cnv_for_sample <- function(sample_id, genes, optimal_solution, titan_base) {
+  sol      <- optimal_solution[optimal_solution$Sample == sample_id, ]
+  seg_path <- file.path(titan_base,
+    paste0(sample_id, '_cluster', sol$Cluster_Solution[1], '.titan.ichor.seg.noSNPs.txt'))
+  seg    <- read_tsv_df(seg_path)
+  ploidy <- as.numeric(sol[1, 3])
+
+  rows <- lapply(seq_len(nrow(genes)), function(j) {
+    g   <- genes[j, ]
+    hit <- seg[seg$Chromosome == g$seqid &
+                 seg$Start    <= g$start &
+                 seg$End      >= g$end, ]
+
+    if (nrow(hit) > 0) {
+      row <- hit[1, ]
+    } else {
+      # Gene spans a breakpoint or is uncovered
+      row <- data.frame(Chromosome     = g$seqid,
+                        Start          = g$start,
+                        End            = g$end,
+                        Corrected_Call = 'Intragenic CNV')
+    }
+    row$Hugo_Symbol          <- g$gene_name
+    row$Tumor_Sample_Barcode <- sample_id
+    row$Ploidy               <- ploidy
+    row
+  })
+
+  rbindlist(rows, fill = TRUE) |> as.data.frame()
+}
+
+# Run annotation for all samples and combine
+cn_data <- lapply(all_samples, annotate_cnv_for_sample,
+                  genes            = genes,
+                  optimal_solution = optimal_solution,
+                  titan_base       = OPTIMAL_TITAN) |>
+  rbindlist(fill = TRUE) |>
+  as.data.frame()
+
+# Classify CNV events relative to ploidy using dplyr::case_when
+cn_data <- cn_data |>
+  mutate(
+    Corrected_Copy_Number = as.numeric(Corrected_Copy_Number),
+    Ploidy                = as.numeric(Ploidy),
+    cn_ratio              = Corrected_Copy_Number / Ploidy,
+    annotation = case_when(
+      Corrected_Call    == 'Intragenic CNV'          ~ 'Intragenic CNV',
+      Corrected_MinorCN == 0                         ~ 'LOH',
+      Chromosome != 'chrX' & cn_ratio >= 2           ~ 'HLAMP',
+      Chromosome != 'chrX' & cn_ratio >= 1.5         ~ 'AMP',
+      Chromosome != 'chrX' & cn_ratio <= 0.25        ~ 'DEL',
+      Chromosome == 'chrX' & cn_ratio >= 1           ~ 'HLAMP',
+      Chromosome == 'chrX' & cn_ratio >= 0.6         ~ 'AMP',
+      Chromosome == 'chrX' & cn_ratio <= 0.125       ~ 'DEL',
+      TRUE                                           ~ NA_character_
+    ),
+    # Intragenic CNV always takes priority over ratio-based classifications
+    annotation = if_else(Corrected_Call == 'Intragenic CNV', 'Intragenic CNV', annotation)
+  ) |>
+  filter(!is.na(annotation))
+
+# Format for maftools cnTable
+custom_cn <- data.frame(
+  Gene        = cn_data$Hugo_Symbol,
+  Sample_name = cn_data$Tumor_Sample_Barcode,
+  CN          = cn_data$annotation,
+  stringsAsFactors = FALSE
+) |> drop_na(CN)
+
+# ── 6. MAF / Oncoplot (maftools) ─────────────────────────────────────────────
+
+# Subset tumor SNVs and write combined flat file for ANNOVAR → MAF conversion
+pluvicto_snv <- tumor[tumor$sample_name %in% all_samples, ]
+write.table(pluvicto_snv,
+            file.path(BASE_PLUVICTO, 'pluvicto_snv.txt'),
+            sep = "\t", col.names = TRUE, row.names = FALSE, quote = FALSE)
+
+# Convert ANNOVAR output to MAF; add pathogenicity flag from PolyPhen2/SIFT/ClinVar
+maf_raw <- maftools::annovarToMaf(
+  annovar  = file.path(BASE_PLUVICTO, 'pluvicto_snv.txt'),
+  refBuild = 'hg38',
+  tsbCol   = 'sample_name'
+)
+maf_raw$pathogenic <- with(maf_raw,
+  Polyphen2_HDIV_pred %in% c('D', 'P') |
+  SIFT_pred == 'D' |
+  CLNSIG %in% c('Pathogenic', 'Pathogenic/Likely_pathogenic', 'Likely_pathogenic')
+)
+write.table(maf_raw,
+            file.path(BASE_PLUVICTO, 'pluvicto_snv.maf'),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# Clinical annotation table for maftools cohort colouring
+clinical_data <- data.frame(
+  Tumor_Sample_Barcode = all_samples,
+  cohort               = rep(c('pluvicto', 'other'),
+                             c(length(pluvicto), length(other_wo_msi)))
+)
+
+# Read MAF with CNV and clinical context
+maf1 <- read.maf(
+  maf          = file.path(BASE_PLUVICTO, 'pluvicto_snv.maf'),
+  cnTable      = custom_cn,
+  clinicalData = clinical_data
+)
+
+# Oncoplot for key prostate cancer driver genes
+oncoplot(
+  maf                     = maf1,
+  genes                   = c('TP53','RB1','PTEN','AR','AREnhancer','CHD1',
+                               'BRCA1','BRCA2','ATM','PALB2',
+                               'MLH1','MLH3','PMS2','MSH2','MSH6','MSH3','CDK12'),
+  sampleOrder             = all_samples,
+  showTumorSampleBarcodes = TRUE,
+  barcode_mar             = 15,
+  SampleNamefontSize      = 1.2,
+  additionalFeature       = c('pathogenic', 'TRUE'),
+  keepGeneOrder           = TRUE,
+  clinicalFeatures        = 'cohort'
+)
+
+# Statistical comparison of mutation frequencies between cohorts
+cohort_pluvicto <- subsetMaf(maf1, clinQuery = "cohort == 'pluvicto'")
+cohort_other    <- subsetMaf(maf1, clinQuery = "cohort == 'other'")
+comparison      <- mafCompare(m1 = cohort_pluvicto, m2 = cohort_other,
+                               m1Name = 'pluvicto', m2Name = 'other', minMut = 5)
+print(comparison$results)
+forestPlot(mafCompareRes = comparison, pVal = 0.05, color = c('royalblue', 'maroon'))
+
+# Compare Pluvicto TMB to TCGA reference cohort
+tcgaCompare(maf = maf1, cohortName = 'Pluvicto', logscale = TRUE, capture_size = 50)
+
+# ── 7. Mutational Signature (SBS) Comparison ─────────────────────────────────
+
+#' Load SigProfiler Activities, filter to given samples, normalise to
+#' proportions, and return with a 'pluvicto' label column.
+load_sbs_activities <- function(path, pluvicto_samples, other_samples) {
+  sig <- read_tsv_df(path)
+  sig <- sig[sig$Samples %in% c(pluvicto_samples, other_samples), ]
+  mat <- sig[, 2:ncol(sig)]
+  mat <- mat[, colSums(mat) != 0, drop = FALSE]
+  mat <- mat / rowSums(mat)
+  mat$id       <- sig$Samples
+  mat$pluvicto <- ifelse(mat$id %in% pluvicto_samples, 'pluvicto', 'not_pluvicto')
+  mat
+}
+
+sig2     <- load_sbs_activities(SIG_ACTIVITIES, pluvicto, other_wo_msi)
+sbs_cols <- setdiff(colnames(sig2), c('id', 'pluvicto'))
+
+# t-test for each SBS signature; collect results in a single pass
+sbs_tests <- do.call(rbind, lapply(sbs_cols, function(sig_name) {
+  p  <- sig2[sig2$pluvicto == 'pluvicto',     sig_name]
+  np <- sig2[sig2$pluvicto == 'not_pluvicto', sig_name]
+  tt <- t.test(p, np)
+  data.frame(SBS             = sig_name,
+             pvalue          = tt$p.value,
+             pluvicto_avg    = tt$estimate[1],
+             nonpluvicto_avg = tt$estimate[2])
+}))
+
+sig_hits <- sbs_tests[!is.na(sbs_tests$pvalue) & sbs_tests$pvalue < 0.05, ]
+print(sig_hits)
+
+# ── 8. File Export & TITAN Staging Utilities ─────────────────────────────────
+
+#' Export per-sample SNV flat files, combined SNV, SV, and CNV files to the
+#' collaboration directory. Directories are created automatically.
+export_pluvicto_files <- function(samples, tumor_df, optimal_sol,
+                                  base_cn, collab_base) {
+  for (sub in c('SNV', 'SV', 'CNV')) dir.create(file.path(collab_base, sub), showWarnings = FALSE)
+
+  for (s in samples) {
+    # Individual SNV file
+    write.table(tumor_df[tumor_df$sample_name == s, ],
+                file.path(collab_base, 'SNV', paste0(s, '_SNV.txt')),
+                sep = "\t", col.names = TRUE, row.names = FALSE, quote = FALSE)
+
+    sol <- optimal_sol[optimal_sol$Sample == s, ]
+    # SV file
+    file.copy(
+      from = file.path(base_cn, 'SV/output/TwoOverlap', s,
+                       paste0(s, '.mergedTitan.sv.txt')),
+      to   = file.path(collab_base, 'SV', paste0(s, '_SV.txt'))
+    )
+    # CNV segment file
+    file.copy(
+      from = file.path(base_cn, 'optimalTITAN',
+                       paste0(s, '_cluster', sol$Cluster_Solution[1],
+                              '.titan.ichor.seg.noSNPs.txt')),
+      to   = file.path(collab_base, 'CNV', paste0(s, '_CNV.txt'))
+    )
+  }
+  # Combined SNV table
+  write.table(tumor_df[tumor_df$sample_name %in% samples, ],
+              file.path(collab_base, 'SNV.txt'),
+              sep = "\t", col.names = TRUE, row.names = FALSE, quote = FALSE)
+}
+
+export_pluvicto_files(pluvicto, tumor, optimal_solution, BASE_CN, BASE_COLLAB)
+
+#' Stage TITAN result files from a run directory into the optimalTITAN archive.
+#' mode = 'folder' copies an entire cluster sub-directory;
+#' mode = 'files'  copies only pattern-matched flat files (default).
+stage_titan_results <- function(optimal_sol, titan_run_base, dest_base, mode = 'files') {
+  for (i in seq_len(nrow(optimal_sol))) {
+    s       <- optimal_sol$sample[i]
+    pattern <- paste0(s, '_cluster', optimal_sol$cluster[i])
+    from_base <- file.path(titan_run_base, paste0('titanCNA_ploidy', optimal_sol$phi[i]))
+
+    if (mode == 'folder') {
+      to_dir <- file.path(dest_base, pattern)
+      dir.create(to_dir, showWarnings = FALSE)
+      for (f in list.files(file.path(from_base, pattern), full.names = TRUE)) {
+        file.copy(f, to_dir)
+      }
+    } else {
+      for (f in list.files(from_base, pattern = pattern, full.names = TRUE)) {
+        file.copy(f, dest_base)
+      }
+    }
+  }
+}
+
+# Stage Pluvicto-specific TITAN outputs
+optimal_pluvicto <- read_excel(file.path(BASE_PLUVICTO, 'OptimalTITAN.xlsx'))
+titan_run_base   <- file.path(BASE_CN,
+  'Tumor_WGS/TitanCNA_tumors_WGS_072024_RERUN/TitanCNA_SV_WGS/results/titan/hmm')
+
+stage_titan_results(optimal_pluvicto, titan_run_base, OPTIMAL_TITAN, mode = 'files')
