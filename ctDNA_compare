@@ -1,0 +1,276 @@
+# =============================================================================
+# Pluvicto ctDNA Overlap Analysis
+#
+# Distinct from scripts 1 & 2. This script focuses on:
+#   1. Loading force-called ctDNA mutations at each timepoint (C1, C2, TAN)
+#   2. Computing overlap of ctDNA variants with tumour WGS mutations
+#   3. Calculating detection rates of site-private (per-metastasis) mutations
+#   4. Calculating detection rates of PyClone cluster mutations in ctDNA
+#   5. Visualising overlap vs. cellular prevalence coloured by clone identity
+#
+# Supported patients: 22-049, 22-051
+# Timepoints: C1 (cycle 1), C2 (cycle 2), TAN (cfDNA WGS)
+# =============================================================================
+
+# ── Libraries ─────────────────────────────────────────────────────────────────
+library(data.table)
+library(ggplot2)
+library(hrbrthemes)
+library(geomtextpath)
+library(stringr)
+
+# ── File Path Constants ───────────────────────────────────────────────────────
+BASE_PROJ      <- '/fh/fast/ha_g/projects/ProstateTAN'
+BASE_PLUVICTO  <- file.path(BASE_PROJ, 'Pluvicto')
+BASE_CTDNA     <- file.path(BASE_PROJ, 'analysis_ctDNA')
+BASE_PYCLONE   <- file.path(BASE_PROJ, 'Pyclone_Power_Analysis')
+
+TUMOR_SNV_PATH <- file.path(BASE_PROJ, 'analysis_ctDNA/SNVs/MasterSNVFile_tumor.txt')
+CTDNA_SNV_PATH <- file.path(BASE_PLUVICTO, 'SNV/MasterSNVFile_ctDNA.txt')
+CLUSTERS_PATH  <- file.path(BASE_PYCLONE, 'Clusters.txt')
+
+# Mapping of patient → TAN (cfDNA WGS) sample identifier
+TAN_SAMPLE_IDS <- list(
+  '22-049' = '22-049_cfPL_1182_WGS',
+  '22-051' = '22-051_cfPL_1183_WGS'
+)
+
+# Colours assigned to ctDNA timepoints
+TIMEPOINT_COLORS <- c(C1 = 'red', C2 = 'yellow', TAN = 'blue')
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+#' Read a tab-separated flat file into a data.frame.
+read_tsv_df <- function(path, ...) {
+  as.data.frame(fread(path, header = TRUE, sep = "\t",
+                      stringsAsFactors = FALSE, na.strings = c(".", "NA"), ...))
+}
+
+#' Parse depth and alt-depth fields from a VCF-style Otherinfo13 column
+#' and add a variant ID (Chr_Start_Ref_Alt).
+#'
+#' @param df  data.frame with columns Chr, Start, Ref, Alt, Otherinfo13
+#' @return    df with additional columns: depth, alt_depth, varID
+parse_variant_fields <- function(df) {
+  info_split    <- strsplit(df$Otherinfo13, ':')
+  df$depth      <- sapply(info_split, function(x) if (length(x) >= 4) x[4] else NA)
+  df$alt_depth  <- sapply(info_split, function(x) if (length(x) >= 4) x[2] else NA)
+  df$alt_depth  <- as.numeric(sub(".*,\\s*", "", df$alt_depth))
+  df$varID      <- paste(df$Chr, df$Start, df$Ref, df$Alt, sep = '_')
+  df
+}
+
+#' Load a force-called ctDNA mutation file, parse variant fields, and filter
+#' to variants with at least one alt read that are also present in the tumour.
+#'
+#' @param path       Path to the *_multianno.txt force-call file
+#' @param tumour_ids Character vector of tumour varIDs to filter against
+#' @return Filtered data.frame
+load_force_called_ctdna <- function(path, tumour_ids) {
+  df <- read_tsv_df(path) |> parse_variant_fields()
+  df <- df[df$alt_depth > 0, ]
+  df <- df[df$varID %in% tumour_ids, ]
+  df
+}
+
+#' Build file paths for C1, C2, and TAN force-call result files for a patient.
+#' TAN uses a separate directory (results_force_call_withoutTopOff).
+#'
+#' @param patient_id  e.g. '22-049'
+#' @param tan_id      TAN sample ID from TAN_SAMPLE_IDS
+#' @return Named list of file paths: C1, C2, TAN
+build_ctdna_paths <- function(patient_id, tan_id, base_ctdna = BASE_CTDNA) {
+  list(
+    C1  = file.path(base_ctdna, 'PowerAnalysis/results_force_call',
+                    paste0(patient_id, '_C1'), 'mutations_unfiltered.hg38_multianno.txt'),
+    C2  = file.path(base_ctdna, 'PowerAnalysis/results_force_call',
+                    paste0(patient_id, '_C2'), 'mutations_unfiltered.hg38_multianno.txt'),
+    TAN = file.path(base_ctdna, 'PowerAnalysis/results_force_call_withoutTopOff',
+                    tan_id, 'mutations_unfiltered.hg38_multianno.txt')
+  )
+}
+
+#' Load all three ctDNA timepoints for a patient.
+#'
+#' @param patient_id  Patient identifier string
+#' @param tumour_ids  varIDs from the tumour WGS data for this patient
+#' @return Named list of data.frames: C1, C2, TAN
+load_patient_ctdna <- function(patient_id, tumour_ids) {
+  paths <- build_ctdna_paths(patient_id, TAN_SAMPLE_IDS[[patient_id]])
+  lapply(paths, load_force_called_ctdna, tumour_ids = tumour_ids)
+}
+
+#' For each tumour site in a patient, compute the fraction of site-private
+#' variants detected in each ctDNA timepoint.
+#'
+#' Site-private = variants present in one site but absent from all others.
+#'
+#' @param tum         Tumour SNV data.frame for the patient (has sample_name, varID)
+#' @param ctdna_list  Named list of ctDNA data.frames (C1, C2, TAN)
+#' @return data.frame: site, timepoint, n_private, n_detected, fraction
+compute_site_private_detection <- function(tum, ctdna_list) {
+  sites <- unique(tum$sample_name)
+
+  results <- lapply(sites, function(site) {
+    site_vars    <- tum$varID[tum$sample_name == site]
+    other_vars   <- tum$varID[tum$sample_name != site]
+    private_vars <- setdiff(site_vars, other_vars)
+    n_private    <- length(private_vars)
+
+    fractions <- sapply(names(ctdna_list), function(tp) {
+      sum(ctdna_list[[tp]]$varID %in% private_vars) / n_private
+    })
+
+    data.frame(
+      site       = site,
+      timepoint  = names(fractions),
+      n_private  = n_private,
+      n_detected = as.integer(fractions * n_private),
+      fraction   = fractions,
+      row.names  = NULL
+    )
+  })
+
+  do.call(rbind, results)
+}
+
+#' Compute the fraction of PyClone cluster mutations detected in each ctDNA
+#' timepoint for a given patient.
+#'
+#' @param pyclone_path  Path to patient PyClone output TSV
+#' @param ctdna_list    Named list of ctDNA data.frames (C1, C2, TAN)
+#' @return data.frame: cluster_id, timepoint, n_cluster, n_detected, fraction
+compute_cluster_detection <- function(pyclone_path, ctdna_list) {
+  pyclone     <- read_tsv_df(pyclone_path)
+  cluster_ids <- unique(pyclone$cluster_id)
+
+  results <- lapply(cluster_ids, function(cl) {
+    cluster_muts <- unique(pyclone$mutation_id[pyclone$cluster_id == cl])
+    n_cluster    <- length(cluster_muts)
+
+    fractions <- sapply(names(ctdna_list), function(tp) {
+      sum(ctdna_list[[tp]]$varID %in% cluster_muts) / n_cluster
+    })
+
+    data.frame(
+      cluster_id = cl,
+      timepoint  = names(fractions),
+      n_cluster  = n_cluster,
+      n_detected = as.integer(fractions * n_cluster),
+      fraction   = fractions,
+      row.names  = NULL
+    )
+  })
+
+  do.call(rbind, results)
+}
+
+#' Barplot of ctDNA detection fractions, coloured by timepoint.
+#'
+#' @param fractions  Named numeric vector (names = timepoint labels)
+#' @param title      Plot title
+plot_detection_barplot <- function(fractions, title = '') {
+  barplot(fractions,
+          col       = TIMEPOINT_COLORS[names(fractions)],
+          names.arg = names(fractions),
+          ylim      = c(0, 1),
+          main      = title,
+          ylab      = 'Fraction Detected')
+}
+
+# ── 1. Load Core Data ─────────────────────────────────────────────────────────
+
+# Full tumour SNV master file (all patients)
+tumor <- read_tsv_df(TUMOR_SNV_PATH)
+
+# Pre-computed ctDNA SNV master file (used only for simple sample subsetting
+# where force-call files are unavailable)
+ctDNA <- read_tsv_df(CTDNA_SNV_PATH)
+
+# PyClone cluster summary (all patients)
+clusters_all <- read_tsv_df(CLUSTERS_PATH)
+
+# ── 2. Patient 22-049 Analysis ────────────────────────────────────────────────
+
+pt_id    <- '22-049'
+tum_049  <- tumor[tumor$patient == pt_id, ]
+tum_049$varID <- paste(tum_049$Chr, tum_049$Start, tum_049$Ref, tum_049$Alt, sep = '_')
+
+# Load force-called ctDNA timepoints, filtered to tumour variants
+ctdna_049 <- load_patient_ctdna(pt_id, tum_049$varID)
+
+# ── 2a. Site-Private Detection (22-049) ───────────────────────────────────────
+# Quantifies how well each ctDNA timepoint captures mutations unique to each met
+site_det_049 <- compute_site_private_detection(tum_049, ctdna_049)
+print(site_det_049)
+
+# Grouped barplot: x-axis grouped by site, bars = C1 / C2 / TAN
+barplot(
+  site_det_049$fraction,
+  col       = TIMEPOINT_COLORS[site_det_049$timepoint],
+  names.arg = paste(site_det_049$site, site_det_049$timepoint, sep = '\n'),
+  main      = paste(pt_id, 'Site-Private Detection'),
+  ylab      = 'Fraction Detected'
+)
+
+# ── 2b. PyClone Cluster Detection (22-049) ────────────────────────────────────
+# Quantifies how well each ctDNA timepoint captures each tumour clone
+pyclone_path_049 <- file.path(BASE_PYCLONE, pt_id, 'pyclone',
+                               paste0(pt_id, '_pyclone_output.tsv'))
+cluster_det_049 <- compute_cluster_detection(pyclone_path_049, ctdna_049)
+
+# Plot one barplot per cluster
+for (cl in unique(cluster_det_049$cluster_id)) {
+  cl_rows <- cluster_det_049[cluster_det_049$cluster_id == cl, ]
+  fracs   <- setNames(cl_rows$fraction, cl_rows$timepoint)
+  plot_detection_barplot(fracs, title = paste(pt_id, '– Cluster', cl))
+}
+
+# ── 2c. Overlap vs. Cellular Prevalence Plot (22-049) ────────────────────────
+# Load cluster annotation table (contains Cellular Prevalence and Clone Identity)
+cluster_ann_049 <- read_tsv_df(file.path(BASE_PYCLONE, 'Clusters.txt'))
+cluster_ann_049 <- cluster_ann_049[cluster_ann_049$Patient == pt_id, ]
+
+# Reshape cluster detection into long format for scatter plot
+det_long_049 <- merge(
+  cluster_det_049,
+  cluster_ann_049[, c('Cluster ID', 'Cellular Prevalence', 'Pyclone Identity')],
+  by.x = 'cluster_id', by.y = 'Cluster ID', all.x = TRUE
+)
+
+ggplot(det_long_049,
+       aes(x = `Cellular Prevalence`, y = fraction,
+           color = `Pyclone Identity`, shape = timepoint)) +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(title   = paste(pt_id, 'ctDNA Overlap vs. Cellular Prevalence'),
+       x       = 'Cellular Prevalence',
+       y       = 'Fraction Detected in ctDNA',
+       color   = 'Clone Identity',
+       shape   = 'Timepoint')
+
+# ── 3. Patient 22-051 Analysis ────────────────────────────────────────────────
+
+pt_id    <- '22-051'
+tum_051  <- tumor[tumor$patient == pt_id, ]
+tum_051$varID <- paste(tum_051$Chr, tum_051$Start, tum_051$Ref, tum_051$Alt, sep = '_')
+
+# Load force-called ctDNA timepoints
+ctdna_051 <- load_patient_ctdna(pt_id, tum_051$varID)
+
+# ── 3a. Overall ctDNA Detection Rate (22-051) ─────────────────────────────────
+# Fraction of all tumour mutations detected per timepoint
+overall_det_051 <- sapply(ctdna_051, function(tp_df) nrow(tp_df) / nrow(tum_051))
+plot_detection_barplot(overall_det_051, title = paste(pt_id, 'Overall ctDNA Detection'))
+
+# ── 3b. Site-Private Detection (22-051) ───────────────────────────────────────
+site_det_051 <- compute_site_private_detection(tum_051, ctdna_051)
+print(site_det_051)
+
+barplot(
+  site_det_051$fraction,
+  col       = TIMEPOINT_COLORS[site_det_051$timepoint],
+  names.arg = paste(site_det_051$site, site_det_051$timepoint, sep = '\n'),
+  main      = paste(pt_id, 'Site-Private Detection'),
+  ylab      = 'Fraction Detected'
+)
