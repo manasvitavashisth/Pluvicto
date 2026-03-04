@@ -193,8 +193,6 @@ clusters_all <- read_tsv_df(CLUSTERS_PATH)
 #' Compute bidirectional overlap counts between tumour WGS and each ctDNA
 #' timepoint: how many ctDNA variants are in the tumour, and vice versa.
 #'
-#' Original script computed these as named objects (c1_tum, tum_c1, etc.) for
-#' manual inspection. This returns a tidy summary table instead.
 #'
 #' @param tum        Tumour SNV data.frame with varID column
 #' @param ctdna_list Named list of ctDNA data.frames with varID column
@@ -220,20 +218,17 @@ tum_049$varID <- paste(tum_049$Chr, tum_049$Start, tum_049$Ref, tum_049$Alt, sep
 ctdna_049 <- load_patient_ctdna(pt_id, tum_049$varID)
 
 # ── 2a. Bidirectional Overlap Counts (22-049) ─────────────────────────────────
-# Reproduces the c1_tum / tum_c1 / c2_tum / tum_c2 / tan_tum / tum_tan objects
-# from the original script as a single tidy summary table
+
 overlap_049 <- compute_bidirectional_overlap(tum_049, ctdna_049)
 print(overlap_049)
 
 # ── 2b. Site-Private Detection (22-049) ───────────────────────────────────────
 # Quantifies how well each ctDNA timepoint captures mutations unique to each met.
-# Reproduces the liver_private / lung_private / soft_private detection barplot.
 site_det_049 <- compute_site_private_detection(tum_049, ctdna_049)
 print(site_det_049)
 
 # Grouped barplot: sites on x-axis with C1/C2/TAN bars per site.
-# Original used hardcoded colours c('red','red','red','blue','blue','blue',
-# 'yellow','yellow','yellow') — reproduced here via TIMEPOINT_COLORS lookup.
+
 barplot(
   site_det_049$fraction,
   col       = TIMEPOINT_COLORS[site_det_049$timepoint],
@@ -244,12 +239,11 @@ barplot(
 
 # ── 2c. PyClone Cluster Detection (22-049) ────────────────────────────────────
 # Quantifies how well each ctDNA timepoint captures each tumour clone.
-# Original looped manually over cluster IDs 0–5; now generalised.
 pyclone_path_049 <- file.path(BASE_PYCLONE, pt_id, 'pyclone',
                                paste0(pt_id, '_pyclone_output.tsv'))
 cluster_det_049 <- compute_cluster_detection(pyclone_path_049, ctdna_049)
 
-# Plot one barplot per cluster (reproduces the 6 manual barplot() calls)
+# Plot one barplot per cluster 
 for (cl in unique(cluster_det_049$cluster_id)) {
   cl_rows <- cluster_det_049[cluster_det_049$cluster_id == cl, ]
   fracs   <- setNames(cl_rows$fraction, cl_rows$timepoint)
@@ -265,7 +259,6 @@ cluster_ann_049 <- read_tsv_df(CLUSTERS_PATH)
 cluster_ann_049 <- cluster_ann_049[cluster_ann_049$Patient == pt_id, ]
 
 # Pivot cluster_det_049 to wide format (one row per cluster, cols = C1/C2/TAN)
-# to match the original cluster table structure used for scatter plotting
 cluster_det_wide_049 <- reshape(
   cluster_det_049[, c('cluster_id', 'timepoint', 'fraction')],
   idvar     = 'cluster_id',
@@ -282,7 +275,6 @@ cluster_ann_049 <- merge(
 )
 
 # Scatter: TAN detection fraction vs. cellular prevalence, coloured by clone identity
-# (reproduces: ggplot(cluster, aes(x=`Cellular Prevalence`, y=TAN, color=`Pyclone Identity`)))
 ggplot(cluster_ann_049,
        aes(x = `Cellular Prevalence`, y = TAN, color = `Pyclone Identity`)) +
   geom_point() +
@@ -292,7 +284,6 @@ ggplot(cluster_ann_049,
        y     = 'TAN Detection Fraction')
 
 # Long-format scatter: all timepoints vs. cellular prevalence
-# (reproduces the manual `a` data.frame reshaping and ggplot call)
 cluster_long_049 <- do.call(rbind, lapply(c('C1', 'C2', 'TAN'), function(tp) {
   data.frame(
     Overlap            = cluster_ann_049[[tp]],
@@ -326,12 +317,10 @@ print(overlap_051)
 
 # ── 3b. Overall ctDNA Detection Rate (22-051) ─────────────────────────────────
 # Fraction of all tumour mutations detected per timepoint.
-# Reproduces: barplot(c(nrow(c1)/nrow(tum), nrow(c2)/nrow(tum), nrow(tan)/nrow(tum)))
 overall_det_051 <- sapply(ctdna_051, function(tp_df) nrow(tp_df) / nrow(tum_051))
 plot_detection_barplot(overall_det_051, title = paste(pt_id, 'Overall ctDNA Detection'))
 
 # ── 3c. Variants NOT detected in C1 (22-051) ──────────────────────────────────
-# Reproduces: a = tum[tum$varID %notin% c1$varID, ]
 # Tumour mutations absent from C1 — useful for identifying what ctDNA misses
 tum_not_in_c1_051 <- tum_051[!tum_051$varID %in% ctdna_051$C1$varID, ]
 message(sprintf('22-051: %d tumour mutations not detected in C1', nrow(tum_not_in_c1_051)))
